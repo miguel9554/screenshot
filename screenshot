@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Select a region, then ask for a filename and folder before saving.
+
+Saves the PNG and puts it on the clipboard. Remembers the last folder used.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
+
+GLib.set_prgname("screenshot")
+Gdk.set_program_class("Screenshot")
+
+STATE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "screenshot", "lastdir",
+)
+DEFAULT_DIR = os.path.expanduser("~/Pictures/screenshots")
+
+
+def grab(path):
+    """Interactive region grab into path. Returns False if cancelled."""
+    if shutil.which("maim"):
+        cmd = ["maim", "-s", "-u", "--format=png", path]
+    else:
+        cmd = ["scrot", "-s", "-o", "-F", path]
+    if subprocess.call(cmd, stderr=subprocess.DEVNULL) != 0:
+        return False
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def last_dir():
+    try:
+        with open(STATE) as f:
+            d = f.read().strip()
+        if os.path.isdir(d):
+            return d
+    except OSError:
+        pass
+    return DEFAULT_DIR
+
+
+def remember_dir(d):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as f:
+        f.write(d)
+
+
+def unique(path):
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists("%s_%d%s" % (root, n, ext)):
+        n += 1
+    return "%s_%d%s" % (root, n, ext)
+
+
+def to_clipboard(path):
+    # xclip reads the file into memory, then forks and owns the selection
+    # until something else claims it, so the file may move or vanish after.
+    subprocess.Popen(
+        ["xclip", "-selection", "clipboard", "-t", "image/png", "-i", path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def persist_clipboard_text():
+    """X11 clipboard ownership dies with the owning process, and dwm has no
+    clipboard manager to keep it alive. If the user copied text out of the
+    dialog, hand it to xclip, which detaches and survives us. An image we put
+    there is already owned by an xclip of its own, so it needs nothing."""
+    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    if not cb.wait_is_text_available():
+        return
+    text = cb.wait_for_text()
+    if not text:
+        return
+    p = subprocess.Popen(
+        ["xclip", "-selection", "clipboard", "-i"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    p.communicate(text.encode())
+
+
+class Dialog(Gtk.Window):
+    # The preview is capped to this box; the window sizes itself around it.
+    MAX_W, MAX_H = 360, 200
+    MIN_W = 240
+
+    def __init__(self, shot):
+        super().__init__(title="Save screenshot")
+        self.shot = shot
+        self.result = None
+
+        # _NET_WM_WINDOW_TYPE_DIALOG makes dwm float the window with no rule.
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        self.connect("destroy", Gtk.main_quit)
+        self.connect("key-press-event", self.on_key)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b"entry, button { min-height: 0; padding: 1px 4px; }"
+            b"button { min-width: 0; }"
+        )
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_border_width(4)
+        self.add(box)
+
+        width = self.MIN_W
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file(shot)
+            # Shrink to fit the cap, but never scale a small capture up.
+            r = min(1.0, self.MAX_W / pb.get_width(), self.MAX_H / pb.get_height())
+            if r < 1.0:
+                pb = pb.scale_simple(
+                    max(1, int(pb.get_width() * r)),
+                    max(1, int(pb.get_height() * r)),
+                    GdkPixbuf.InterpType.BILINEAR,
+                )
+            width = max(width, pb.get_width())
+            box.pack_start(Gtk.Image.new_from_pixbuf(pb), False, False, 0)
+        except Exception:
+            pass
+
+        self.entry = Gtk.Entry()
+        self.entry.set_text(time.strftime("screenshot_%Y%m%d_%H%M%S.png"))
+        self.entry.set_activates_default(True)
+        self.entry.set_width_chars(1)  # do not let the entry dictate the width
+        # Preselect the name, keeping the extension out of the selection.
+        self.entry.grab_focus()
+        self.entry.select_region(0, len(self.entry.get_text()) - 4)
+        box.pack_start(self.entry, False, False, 0)
+
+        # A plain button instead of a FileChooserButton: the latter has a large
+        # minimum width that would stretch the window.
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.folder = last_dir()
+        os.makedirs(self.folder, exist_ok=True)
+        self.folder_btn = Gtk.Button()
+        label = Gtk.Label(label=self.folder_label())
+        label.set_ellipsize(Pango.EllipsizeMode.START)
+        label.set_xalign(0)
+        self.folder_btn.add(label)
+        self.folder_btn.set_tooltip_text(self.folder)
+        self.folder_btn.connect("clicked", self.pick_folder)
+        row.pack_start(self.folder_btn, True, True, 0)
+
+        save = Gtk.Button(label="Save")
+        save.connect("clicked", lambda *_: self.save())
+        save.set_can_default(True)
+        row.pack_start(save, False, False, 0)
+        box.pack_start(row, False, False, 0)
+
+        self.set_size_request(width, -1)
+        self.show_all()
+        save.grab_default()
+
+    def folder_label(self):
+        home = os.path.expanduser("~")
+        d = self.folder
+        return "~" + d[len(home):] if d.startswith(home) else d
+
+    def pick_folder(self, _btn):
+        dlg = Gtk.FileChooserDialog(
+            title="Destination folder", transient_for=self, modal=True,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+        dlg.set_current_folder(self.folder)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self.folder = dlg.get_filename()
+            self.folder_btn.get_child().set_text(self.folder_label())
+            self.folder_btn.set_tooltip_text(self.folder)
+        dlg.destroy()
+
+    def on_key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            self.destroy()
+            return True
+        return False
+
+    def save(self):
+        name = self.entry.get_text().strip() or time.strftime("screenshot_%Y%m%d_%H%M%S")
+        name = os.path.basename(name)
+        if not name.lower().endswith(".png"):
+            name += ".png"
+        folder = self.folder
+        os.makedirs(folder, exist_ok=True)
+        self.result = unique(os.path.join(folder, name))
+        remember_dir(folder)
+        self.destroy()
+
+
+def main():
+    fd, tmp = tempfile.mkstemp(suffix=".png", prefix="screenshot-")
+    os.close(fd)
+    try:
+        if not grab(tmp):
+            return 1
+        # Copy before the dialog opens: whatever the user copies while typing
+        # in it should win over the screenshot.
+        to_clipboard(tmp)
+        dlg = Dialog(tmp)
+        Gtk.main()
+        persist_clipboard_text()
+        if not dlg.result:
+            return 1
+        shutil.move(tmp, dlg.result)
+        print(dlg.result)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
