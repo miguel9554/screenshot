@@ -1,0 +1,46 @@
+#!/bin/bash
+
+PIDFILE=/tmp/screenrec.pid
+
+if [ ! -f "$PIDFILE" ]; then
+    echo "No active recording found."
+    exit 1
+fi
+
+if grep -q '^pid=' "$PIDFILE"; then
+    . "$PIDFILE"
+else
+    pid=$(cat "$PIDFILE")
+fi
+
+if [ -z "$pid" ]; then
+    echo "Invalid recording state, cleaning up."
+    rm "$PIDFILE"
+    exit 1
+fi
+
+if ! kill -0 "$pid" 2>/dev/null; then
+    echo "Process $pid not found, cleaning up."
+    rm "$PIDFILE"
+    exit 1
+fi
+
+kill -SIGINT "$pid"
+
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+done
+
+rm "$PIDFILE"
+
+if [ -z "$outfile" ]; then
+    outfile=$(find "$HOME/Videos/screen-recordings" -maxdepth 1 -type f -name 'recording-*.mp4' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+fi
+
+if [ ! -s "$outfile" ]; then
+    echo "Recording stopped, but output file was not found: $outfile"
+    exit 1
+fi
+
+printf 'file://%s\n' "$(realpath "$outfile")" | xclip -selection clipboard -t text/uri-list
+echo "Recording stopped and copied to clipboard: $outfile"
