@@ -57,14 +57,19 @@ def remember_dir(d):
         f.write(d)
 
 
-def unique(path):
+def backup(path):
+    """Move an existing file aside as name_backup_N.ext so the new screenshot
+    can take its place without destroying anything. Returns the backup path,
+    or None if there was nothing to move."""
     if not os.path.exists(path):
-        return path
+        return None
     root, ext = os.path.splitext(path)
     n = 1
-    while os.path.exists("%s_%d%s" % (root, n, ext)):
+    while os.path.exists("%s_backup_%d%s" % (root, n, ext)):
         n += 1
-    return "%s_%d%s" % (root, n, ext)
+    dest = "%s_backup_%d%s" % (root, n, ext)
+    os.rename(path, dest)
+    return dest
 
 
 def to_clipboard(path):
@@ -205,7 +210,7 @@ class Dialog(Gtk.Window):
             name += ".png"
         folder = self.folder
         os.makedirs(folder, exist_ok=True)
-        self.result = unique(os.path.join(folder, name))
+        self.result = os.path.join(folder, name)
         remember_dir(folder)
         self.destroy()
 
@@ -224,6 +229,9 @@ def main():
         persist_clipboard_text()
         if not dlg.result:
             return 1
+        old = backup(dlg.result)
+        if old:
+            print("backed up existing file to %s" % old, file=sys.stderr)
         shutil.move(tmp, dlg.result)
         print(dlg.result)
     finally:

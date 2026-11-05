@@ -29,8 +29,9 @@ WM_CLASS is `screenshot` / `Screenshot`:
 ```
 
 Keys: `Enter` saves, `Esc` cancels. Cancelling the region select or the
-dialog leaves nothing behind. Existing names are never overwritten — a
-`_1`, `_2`, ... suffix is added.
+dialog leaves nothing behind. The name you type is used as-is; if a file is
+already there it is renamed to `name_backup_1.png` (`_2`, `_3`, ...) first,
+so the new shot takes the name and the old file is never lost.
 
 Deps: python-gobject, gtk3, maim (or scrot), xclip.
 
